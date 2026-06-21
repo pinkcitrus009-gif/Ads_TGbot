@@ -2,11 +2,12 @@ import requests
 from collections import defaultdict
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-import os
 
-TOKEN = os.environ.get("TG_TOKEN", "")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+import config
+
+TOKEN = config.TG_TOKEN
+OPENROUTER_API_KEY = config.OPENROUTER_API_KEY
+OPENROUTER_URL = config.OPENROUTER_URL
 MAX_HISTORY = 20
 
 chat_histories = defaultdict(list)
@@ -64,7 +65,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         data = {
-            "model": "openrouter/owl-alpha",
+            "model": config.OPENROUTER_MODEL,
             "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + chat_histories[chat_id],
             "max_tokens": 700,
             "temperature": 0.8
@@ -91,7 +92,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         data = {
-            "model": "openrouter/owl-alpha",
+            "model": config.OPENROUTER_MODEL,
             "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + chat_histories[chat_id],
             "max_tokens": 500,
             "temperature": 0.9

@@ -1,0 +1,20 @@
+# Окружение и секреты
+.env
+
+# Локальные базы данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Прочее
+*.log
+.DS_Store
