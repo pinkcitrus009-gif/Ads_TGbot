@@ -1,4 +1,4 @@
-﻿import sqlite3
+import sqlite3
 import json
 import os
 from datetime import datetime
@@ -17,11 +17,10 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.create_tables()
+        self._migrate()
 
     def create_tables(self):
         self.conn.executescript('''
-            -- Per-player character data keyed by (group_id, user_id)
-            -- For private chats group_id == user_id (Telegram private chat id == user id)
             CREATE TABLE IF NOT EXISTS players (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 group_id     INTEGER NOT NULL,
@@ -53,7 +52,6 @@ class Database:
                 UNIQUE(group_id, user_id)
             );
 
-            -- Shared narrative history per group
             CREATE TABLE IF NOT EXISTS history (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 group_id   INTEGER NOT NULL,
@@ -66,7 +64,6 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_history ON history(group_id, created_at);
 
-            -- Quests are per group (shared story)
             CREATE TABLE IF NOT EXISTS quests (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 group_id    INTEGER NOT NULL,
@@ -76,7 +73,6 @@ class Database:
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- Who is playing in each group (for multi-player)
             CREATE TABLE IF NOT EXISTS party (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 group_id   INTEGER NOT NULL,
@@ -87,17 +83,16 @@ class Database:
                 UNIQUE(group_id, user_id)
             );
 
-            -- Turn state per group (combat / exploration turns)
             CREATE TABLE IF NOT EXISTS turn_state (
-                group_id     INTEGER PRIMARY KEY,
-                turn_order   TEXT    DEFAULT '[]',
-                current_idx  INTEGER DEFAULT 0,
-                round_number INTEGER DEFAULT 1,
-                mode         TEXT    DEFAULT 'exploration',
-                updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                group_id              INTEGER PRIMARY KEY,
+                turn_order            TEXT    DEFAULT '[]',
+                current_idx           INTEGER DEFAULT 0,
+                round_number          INTEGER DEFAULT 1,
+                mode                  TEXT    DEFAULT 'exploration',
+                pending_clarification TEXT    DEFAULT NULL,
+                updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- Save slots
             CREATE TABLE IF NOT EXISTS saved_games (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 group_id     INTEGER NOT NULL,
@@ -109,8 +104,53 @@ class Database:
                 created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(group_id, user_id, save_name)
             );
+
+            CREATE TABLE IF NOT EXISTS game_memory (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id   INTEGER NOT NULL,
+                category   TEXT    NOT NULL,
+                key        TEXT    NOT NULL,
+                value      TEXT    NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(group_id, category, key) ON CONFLICT REPLACE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory ON game_memory(group_id, category);
         ''')
         self.conn.commit()
+
+    def _migrate(self):
+        """Add columns/tables missing from older DB schema (safe no-op if already present)."""
+        for col_def in [
+            "pending_clarification TEXT DEFAULT NULL",
+        ]:
+            col_name = col_def.split()[0]
+            try:
+                self.conn.execute(f"ALTER TABLE turn_state ADD COLUMN {col_def}")
+                self.conn.commit()
+            except Exception:
+                pass
+
+        # game_memory table — добавляем если не создалось через create_tables (старая БД)
+        try:
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS game_memory ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "group_id INTEGER NOT NULL, "
+                "category TEXT NOT NULL, "
+                "key TEXT NOT NULL, "
+                "value TEXT NOT NULL, "
+                "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                "UNIQUE(group_id, category, key) ON CONFLICT REPLACE)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory ON game_memory(group_id, category)"
+            )
+            self.conn.commit()
+        except Exception:
+            pass
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -247,7 +287,6 @@ class Database:
             (group_id, user_id, username)
         )
         self.conn.commit()
-        # Ensure player record exists
         self.create_player(group_id, user_id, username)
         return True
 
@@ -293,19 +332,25 @@ class Database:
             return None
         d = dict(row)
         d['turn_order'] = json.loads(d['turn_order'])
+        d['pending_clarification'] = (
+            json.loads(d['pending_clarification'])
+            if d.get('pending_clarification') else None
+        )
         return d
 
     def set_turn_state(self, group_id: int, turn_order: List[int],
                        current_idx: int = 0, round_number: int = 1,
                        mode: str = 'combat'):
         self.conn.execute(
-            '''INSERT INTO turn_state (group_id, turn_order, current_idx, round_number, mode, updated_at)
-               VALUES (?,?,?,?,?,?)
+            '''INSERT INTO turn_state
+               (group_id, turn_order, current_idx, round_number, mode, pending_clarification, updated_at)
+               VALUES (?,?,?,?,?,NULL,?)
                ON CONFLICT(group_id) DO UPDATE SET
                  turn_order=excluded.turn_order,
                  current_idx=excluded.current_idx,
                  round_number=excluded.round_number,
                  mode=excluded.mode,
+                 pending_clarification=NULL,
                  updated_at=excluded.updated_at''',
             (group_id, json.dumps(turn_order), current_idx, round_number, mode,
              datetime.now().isoformat())
@@ -316,14 +361,27 @@ class Database:
         ts = self.get_turn_state(group_id)
         if not ts or not ts['turn_order']:
             return None
-        next_idx = (ts['current_idx'] + 1) % len(ts['turn_order'])
+        next_idx  = (ts['current_idx'] + 1) % len(ts['turn_order'])
         new_round = ts['round_number'] + (1 if next_idx == 0 else 0)
         self.conn.execute(
-            'UPDATE turn_state SET current_idx=?, round_number=?, updated_at=? WHERE group_id=?',
+            '''UPDATE turn_state
+               SET current_idx=?, round_number=?, pending_clarification=NULL, updated_at=?
+               WHERE group_id=?''',
             (next_idx, new_round, datetime.now().isoformat(), group_id)
         )
         self.conn.commit()
         return self.get_turn_state(group_id)
+
+    def set_pending_clarification(self, group_id: int, data: Optional[Dict]):
+        val = json.dumps(data, ensure_ascii=False) if data else None
+        self.conn.execute(
+            'UPDATE turn_state SET pending_clarification=?, updated_at=? WHERE group_id=?',
+            (val, datetime.now().isoformat(), group_id)
+        )
+        self.conn.commit()
+
+    def clear_pending_clarification(self, group_id: int):
+        self.set_pending_clarification(group_id, None)
 
     def clear_turn_state(self, group_id: int):
         self.conn.execute('DELETE FROM turn_state WHERE group_id=?', (group_id,))
@@ -384,6 +442,50 @@ class Database:
             (group_id, user_id)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Game Memory ───────────────────────────────────────────────────────────
+
+    def add_memory(self, group_id: int, category: str, key: str, value: str):
+        """Добавить или обновить запись в долгосрочной памяти DM."""
+        now = datetime.now().isoformat()
+        self.conn.execute(
+            '''INSERT INTO game_memory (group_id, category, key, value, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(group_id, category, key) DO UPDATE SET
+                 value=excluded.value,
+                 updated_at=excluded.updated_at''',
+            (group_id, category.lower(), key, value, now, now)
+        )
+        self.conn.commit()
+
+    def get_memory(self, group_id: int, category: str = None) -> List[Dict]:
+        """Получить записи памяти. category=None → все категории."""
+        if category:
+            rows = self.conn.execute(
+                'SELECT category, key, value FROM game_memory '
+                'WHERE group_id=? AND category=? ORDER BY category, key',
+                (group_id, category.lower())
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                'SELECT category, key, value FROM game_memory '
+                'WHERE group_id=? ORDER BY category, key',
+                (group_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_memory(self, group_id: int, key: str) -> bool:
+        """Удалить запись памяти по ключу (ищет во всех категориях)."""
+        cur = self.conn.execute(
+            'DELETE FROM game_memory WHERE group_id=? AND key=?', (group_id, key)
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def clear_memory(self, group_id: int):
+        """Очистить всю память для группы."""
+        self.conn.execute('DELETE FROM game_memory WHERE group_id=?', (group_id,))
+        self.conn.commit()
 
     def close(self):
         if self.conn:

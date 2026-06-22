@@ -1,11 +1,19 @@
-﻿"""
+"""
 D&D Master Bot v3
 Новое в v3:
 - Авто-трекинг сюжета: DM сам обновляет HP/XP/золото/предметы/способности/квесты через [STATE] блок
 - Групповой чат: несколько игроков в одном Telegram-чате
-- Система ходов по инициативе
+- Улучшенная система ходов: /ход = официальное действие, обычный чат = OOC
+- Уточнения DM: тегает игрока, игрок отвечает реплаем
+- Таймер хода: предупреждение через 3 мин, автопропуск через 5 мин
 - Приватные листы персонажа (только игрок видит свой лист)
 - Каждый игрок — свой персонаж в каждой группе
+
+Изменения Phase 1:
+- Убраны кнопки d20/быстрая атака, компактные клавиатуры
+- Лист/Инвентарь/Квесты в группах → отправляются в личку
+- Username обновляется при каждом взаимодействии
+- Исправлен KeyError '"hp_change"' в BASE_PROMPT
 """
 
 import asyncio
@@ -24,8 +32,9 @@ from telegram.constants import ChatAction
 
 from character import (
     CLASSES, RACES, SKILL_MAP, bar, build_context, build_party_context,
-    check_level_up, default_spell_slots, format_status, modifier,
-    modifier_str, parse_ai_state, roll_dice, roll_stats_array, xp_for_level,
+    check_level_up, default_spell_slots, format_memory_block, format_status,
+    modifier, modifier_str, parse_ai_state, roll_dice, roll_stats_array,
+    xp_for_level,
 )
 from database import Database
 from keyboards import (
@@ -64,7 +73,13 @@ CHOOSE_RACE, CHOOSE_CLASS, CHOOSE_STATS, ENTER_NAME, CONFIRM = range(5)
 # ── Helpers: chat type ────────────────────────────────────────────────────────
 
 def is_group(update: Update) -> bool:
-    return update.effective_chat.type in (Chat.GROUP, Chat.SUPERGROUP)
+    chat = update.effective_chat
+    if chat is None:
+        # For callback queries, use the message chat
+        if update.callback_query and update.callback_query.message:
+            return update.callback_query.message.chat.type in (Chat.GROUP, Chat.SUPERGROUP)
+        return False
+    return chat.type in (Chat.GROUP, Chat.SUPERGROUP)
 
 def get_ids(update: Update):
     """Return (group_id, user_id). For private chats group_id == user_id."""
@@ -86,19 +101,17 @@ BASE_PROMPT = """Ты — мастер подземелий (DM) для наст
 • Ответы 150–300 слов. В конце — открытый вопрос или выбор для игроков
 • Учитывай характеристики персонажа — они реально влияют на события
 
+СИСТЕМА ХОДОВ В ГРУППЕ (важно!):
+• Сообщения с пометкой [ДЕЙСТВИЕ] — официальный ход игрока. Обработай и опиши результат.
+• Сообщения с пометкой [OOC] — внеигровой чат между игроками. Кратко ответь если обращаются к тебе, ход не меняется.
+• Если нужно уточнение у игрока — обязательно обратись к нему по @username и задай конкретный вопрос.
+• Не говори "ход переходит к следующему" — бот сам объявит это.
+
 АВТО-ОБНОВЛЕНИЕ СОСТОЯНИЯ:
-Это самое важное! Если в сцене произошло что-то из списка:
-- Персонаж получил урон или исцеление
-- Нашёл/купил предмет
-- Продал/потратил предмет  
-- Получил золото или потратил его
-- Получил новую способность
-- Начался или завершился квест
+Если в сцене произошло что-то из списка — добавь в САМЫЙ КОНЕЦ ответа блок STATE:
+[STATE]{{"hp_change":0,"gold":0,"exp":0,"items_add":[],"items_remove":[],"abilities_add":[],"quests_add":[],"quests_done":[],"memory":[]}}[/STATE]
 
-→ Добавь в САМЫЙ КОНЕЦ ответа (после всего текста) блок:
-[STATE]{{"hp_change":0,"gold":0,"exp":0,"items_add":[],"items_remove":[],"abilities_add":[],"quests_add":[],"quests_done":[]}}[/STATE]
-
-Правила блока STATE:
+Правила полей STATE:
 • hp_change: число (отрицательное = урон, положительное = лечение, 0 = без изменений)
 • gold: изменение золота (+50, -10, 0)
 • exp: XP за событие/победу (0 если ничего не было)
@@ -107,17 +120,32 @@ BASE_PROMPT = """Ты — мастер подземелий (DM) для наст
 • abilities_add: новые способности или заклинания ["Огненный шар"]
 • quests_add: названия новых квестов ["Найти дракона"]
 • quests_done: ID выполненных квестов [3, 7]
-Если ничего не изменилось — не добавляй блок STATE вообще.
+• memory: важные факты для долгосрочной памяти DM (см. ниже)
+
+ДОЛГОСРОЧНАЯ ПАМЯТЬ — записывай СРАЗУ, как только появился важный факт:
+Формат: [{{"category":"тип","key":"краткое название","value":"факт"}}]
+Категории:
+  npc    — персонажи: имя, отношение, статус ("Стражник Торн — предал партию, работает на Гильдию")
+  plot   — ключевые события сюжета ("Артефакт найден, теперь у мага Зардуса")
+  world  — места, правила мира ("Город Сильвермун — нейтральный, комендантский час с 22:00")
+  player — важные факты об игроках ("Кирин боится огня после пожара в деревне")
+  loot   — особые предметы с историей ("Кольцо тени — ворованное у лорда Малика")
+Если в сцене нет ничего важного для памяти — оставь "memory": [].
+Если ничего не изменилось вообще — не добавляй блок STATE.
+
+{memory}
 
 {context}"""
 
 
-def make_system_prompt(player_or_party, quests, is_group_game: bool = False) -> str:
+def make_system_prompt(player_or_party, quests, memories: list = None,
+                       is_group_game: bool = False) -> str:
     if is_group_game and isinstance(player_or_party, list):
         ctx = build_party_context(player_or_party, quests)
     else:
         ctx = build_context(player_or_party, quests)
-    return BASE_PROMPT.format(context=ctx)
+    mem_block = format_memory_block(memories or [])
+    return BASE_PROMPT.format(context=ctx, memory=mem_block)
 
 
 # ── AI ────────────────────────────────────────────────────────────────────────
@@ -141,6 +169,9 @@ async def ask_ai(messages: list, max_tokens: int = 900) -> str:
                     if resp.status == 429:
                         await asyncio.sleep(5 * attempt)
                         continue
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error("API error %d: %s", resp.status, body)
                     resp.raise_for_status()
                     data = await resp.json()
                     return data["choices"][0]["message"]["content"]
@@ -255,6 +286,17 @@ async def apply_state_update(group_id: int, user_id: int, state: dict) -> str:
         if db.complete_quest(group_id, qid):
             changes.append(f"✅ Квест #{qid} выполнен")
 
+    # Memory — долгосрочная память DM
+    for entry in state.get("memory", []):
+        if not isinstance(entry, dict):
+            continue
+        cat = str(entry.get("category", "world")).lower()
+        key = str(entry.get("key", "")).strip()
+        val = str(entry.get("value", "")).strip()
+        if key and val:
+            db.add_memory(group_id, cat, key, val)
+            logger.info("Memory saved [%s] %s: %s", cat, key, val)
+
     if updates:
         db.update_player(group_id, user_id, **updates)
 
@@ -279,18 +321,20 @@ def split_msg(text: str, max_len: int = 4000) -> list:
 # ── Core DM reply ─────────────────────────────────────────────────────────────
 
 async def dm_reply(update: Update, group_id: int, user_id: int, extra_text: str = ""):
-    """Get DM reply, auto-apply state updates, send response."""
+    """Get DM reply, auto-apply state updates, send response. Returns last sent Message."""
     await compress_history(group_id)
-    player  = db.get_player(group_id, user_id)
-    quests  = db.get_quests(group_id)
-    party   = db.get_party(group_id)
+    player   = db.get_player(group_id, user_id)
+    quests   = db.get_quests(group_id)
+    party    = db.get_party(group_id)
     in_group = is_group(update)
+
+    memories = db.get_memory(group_id)
 
     if in_group and len(party) > 1:
         players = db.get_all_players_in_group(group_id)
-        system  = make_system_prompt(players, quests, is_group_game=True)
+        system  = make_system_prompt(players, quests, memories=memories, is_group_game=True)
     else:
-        system = make_system_prompt(player, quests)
+        system = make_system_prompt(player, quests, memories=memories)
 
     history  = db.get_history(group_id, MAX_HISTORY)
     messages = [{"role": "system", "content": system}] + history
@@ -299,9 +343,8 @@ async def dm_reply(update: Update, group_id: int, user_id: int, extra_text: str 
         raw_reply = await ask_ai(messages)
     except Exception as e:
         await update.effective_message.reply_text(f"❌ Ошибка AI: {e}")
-        return
+        return None
 
-    # Parse and apply state updates
     clean_reply, state = parse_ai_state(raw_reply)
     state_summary = ""
     if state:
@@ -309,33 +352,45 @@ async def dm_reply(update: Update, group_id: int, user_id: int, extra_text: str 
 
     db.add_message(group_id, "assistant", clean_reply)
 
-    # Build output
     full_text = clean_reply
     if state_summary:
         full_text = full_text + f"\n\n━━━━━━━━━━\n{state_summary}"
 
-    # Turn system annotation for group games
-    ts = db.get_turn_state(group_id)
-    turn_note = ""
-    if ts and ts.get("turn_order") and in_group:
-        order    = ts["turn_order"]
-        cur_uid  = order[ts["current_idx"] % len(order)] if order else None
-        if cur_uid:
-            pmembers = {m["user_id"]: m["username"] for m in party}
-            cur_name = pmembers.get(cur_uid, str(cur_uid))
-            turn_note = (
-                f"\n\n⚔️ Раунд {ts['round_number']} — ход: "
-                f"@{cur_name} | /done чтобы передать ход"
-            )
-
-    full_text += turn_note
-
-    in_combat  = bool(player and player.get("combat_state"))
+    in_combat = bool(player and player.get("combat_state"))
     kb = (group_combat_keyboard() if (in_group and in_combat)
           else (combat_keyboard() if in_combat else main_keyboard()))
 
+    sent = None
     for chunk in split_msg(full_text):
-        await update.effective_message.reply_text(chunk, reply_markup=kb)
+        sent = await update.effective_message.reply_text(chunk, reply_markup=kb)
+    return sent
+
+
+# ── Turn system helpers ────────────────────────────────────────────────────────
+
+def _turn_banner(ts: dict, party: list, group_id: int) -> str:
+    """Build a beautiful turn announcement string."""
+    order      = ts["turn_order"]
+    cur_uid    = order[ts["current_idx"] % len(order)]
+    name_map   = {m["user_id"]: m["username"] for m in party}
+    cur_uname  = name_map.get(cur_uid, str(cur_uid))
+    p          = db.get_player(group_id, cur_uid)
+    char_name  = p["name"]   if p else cur_uname
+    cls        = p["class"]  if p else ""
+    lvl        = p["level"]  if p else 1
+    hp         = p["hp"]     if p else "?"
+    max_hp     = p["max_hp"] if p else "?"
+    hp_bar     = bar(hp, max_hp, 8) if isinstance(hp, int) else ""
+    total      = len(order)
+    idx        = ts["current_idx"] % total + 1
+    return (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚔️ Раунд {ts['round_number']} | Ход {idx}/{total}\n"
+        f"👤 @{cur_uname} ({char_name} — {cls} ур.{lvl})\n"
+        f"❤️ {hp}/{max_hp}  {hp_bar}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Используй /ход <действие> или /пас"
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -557,12 +612,11 @@ async def cmd_roll_initiative(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     db.reset_initiatives(group_id)
-    rolls    = []
-    order    = []
+    rolls = []
 
     for m in members:
-        p   = db.get_player(group_id, m["user_id"])
-        dex = p["dexterity"] if p else 10
+        p       = db.get_player(group_id, m["user_id"])
+        dex     = p["dexterity"] if p else 10
         dex_mod = modifier(dex)
         roll    = random.randint(1, 20)
         total   = roll + dex_mod
@@ -570,21 +624,18 @@ async def cmd_roll_initiative(update: Update, context: ContextTypes.DEFAULT_TYPE
         rolls.append((total, random.random(), m["user_id"], m["username"], roll, dex_mod))
 
     rolls.sort(reverse=True)
+    order = [r[2] for r in rolls]
 
     lines = ["🎲 Инициатива:\n"]
     for i, (total, _, uid, uname, roll, dex_mod) in enumerate(rolls, 1):
-        order.append(uid)
         sign = "+" if dex_mod >= 0 else ""
         lines.append(f"{i}. @{uname}: {roll} {sign}{dex_mod} = **{total}**")
 
-    # Handle ties (already broken by random.random())
     db.set_turn_state(group_id, order, current_idx=0, round_number=1, mode="combat")
-
-    first_uid  = order[0]
-    first_name = rolls[0][3]
-    lines.append(f"\n⚔️ Первым ходит: @{first_name}!")
+    ts = db.get_turn_state(group_id)
 
     await update.message.reply_text("\n".join(lines), reply_markup=party_keyboard())
+    await update.message.reply_text(_turn_banner(ts, members, group_id))
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -609,25 +660,138 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    new_ts   = db.advance_turn(group_id)
-    new_order = new_ts["turn_order"]
-    new_uid   = new_order[new_ts["current_idx"] % len(new_order)]
-    members   = db.get_party(group_id)
-    name_map  = {m["user_id"]: m["username"] for m in members}
-    new_name  = name_map.get(new_uid, str(new_uid))
+    db.clear_pending_clarification(group_id)
+    new_ts  = db.advance_turn(group_id)
+    members = db.get_party(group_id)
+    await update.message.reply_text(_turn_banner(new_ts, members, group_id))
 
-    await update.message.reply_text(
-        f"✅ Ход передан!\n"
-        f"⚔️ Раунд {new_ts['round_number']} — ход: @{new_name}!",
-        reply_markup=party_keyboard(),
-    )
+
+async def cmd_khod(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ход <действие> — официальное игровое действие текущего игрока."""
+    group_id, user_id = get_ids(update)
+
+    if not is_group(update):
+        await update.message.reply_text(
+            "❌ /ход работает только в групповых чатах.\n"
+            "В личке просто напиши что делаешь!"
+        )
+        return
+
+    ts = db.get_turn_state(group_id)
+    if not ts or not ts["turn_order"]:
+        await update.message.reply_text(
+            "⚠️ Бой не начат. /roll_initiative чтобы начать."
+        )
+        return
+
+    order   = ts["turn_order"]
+    cur_uid = order[ts["current_idx"] % len(order)]
+
+    if cur_uid != user_id:
+        party    = db.get_party(group_id)
+        name_map = {m["user_id"]: m["username"] for m in party}
+        await update.message.reply_text(
+            f"⚠️ Сейчас ход @{name_map.get(cur_uid,'?')}!\n"
+            f"Ты можешь свободно общаться — /ход доступен только в свою очередь."
+        )
+        return
+
+    pc = ts.get("pending_clarification")
+    if pc:
+        await update.message.reply_text(
+            "⏳ DM ждёт уточнения от тебя!\n"
+            "Ответь реплаем на вопрос DM, потом продолжишь."
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📝 Опиши своё действие:\n"
+            "Например: /ход Атакую ближайшего гоблина мечом"
+        )
+        return
+
+    action   = " ".join(context.args)
+    player   = db.get_player(group_id, user_id)
+    username = get_username(update)
+    char_name = player["name"] if player else username
+
+    action_text = f"[ДЕЙСТВИЕ] {char_name} (@{username}): {action}"
+    db.add_message(group_id, "user", action_text, user_id=user_id)
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    sent = await dm_reply(update, group_id, user_id)
+
+    dm_text = (sent.text if sent else "") or ""
+    if sent and "?" in dm_text:
+        party    = db.get_party(group_id)
+        name_map = {m["user_id"]: m["username"] for m in party}
+        uname    = name_map.get(user_id, str(user_id))
+        if f"@{uname}" in dm_text or char_name in dm_text:
+            db.set_pending_clarification(group_id, {
+                "user_id":        user_id,
+                "dm_message_id":  sent.message_id,
+                "original_action": action,
+            })
+            return
+
+    async def _advance():
+        await asyncio.sleep(2)
+        db.clear_pending_clarification(group_id)
+        new_ts = db.advance_turn(group_id)
+        if new_ts and new_ts["turn_order"]:
+            party = db.get_party(group_id)
+            await context.bot.send_message(group_id, _turn_banner(new_ts, party, group_id))
+
+    asyncio.create_task(_advance())
+
+
+async def cmd_turn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/turn — алиас /ход."""
+    await cmd_khod(update, context)
+
+
+async def cmd_pas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/пас — пропустить свой ход (уклонение)."""
+    group_id, user_id = get_ids(update)
+    ts = db.get_turn_state(group_id)
+
+    if not ts or not ts["turn_order"]:
+        await update.message.reply_text("⚠️ Нет активного боя.")
+        return
+
+    order   = ts["turn_order"]
+    cur_uid = order[ts["current_idx"] % len(order)]
+
+    if cur_uid != user_id:
+        party    = db.get_party(group_id)
+        name_map = {m["user_id"]: m["username"] for m in party}
+        await update.message.reply_text(
+            f"⚠️ Сейчас ход @{name_map.get(cur_uid,'?')}!"
+        )
+        return
+
+    player   = db.get_player(group_id, user_id)
+    username = get_username(update)
+    char_name = player["name"] if player else username
+
+    await update.message.reply_text(f"🛡️ {char_name} уклоняется — ход пропущен.")
+    db.clear_pending_clarification(group_id)
+    new_ts = db.advance_turn(group_id)
+    if new_ts and new_ts["turn_order"]:
+        party = db.get_party(group_id)
+        await update.message.reply_text(_turn_banner(new_ts, party, group_id))
+
+
+async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/skip — алиас /пас."""
+    await cmd_pas(update, context)
 
 
 async def cmd_end_combat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """End combat and turn system."""
     group_id = update.effective_chat.id
     db.clear_turn_state(group_id)
-    # Clear combat state for all players
     for m in db.get_party(group_id):
         db.update_player(group_id, m["user_id"], combat_state=None)
     await update.message.reply_text(
@@ -646,21 +810,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data     = query.data
     group_id = query.message.chat_id
     user_id  = query.from_user.id
-    player   = db.get_player(group_id, user_id)
 
-    # my_status always private (answered only to clicking user)
+    # Обновляем username при каждом взаимодействии
+    username_cb = query.from_user.username or query.from_user.first_name or str(user_id)
+    player = db.get_player(group_id, user_id)
+    if player:
+        if player.get("username") != username_cb:
+            db.update_player(group_id, user_id, username=username_cb)
+            player["username"] = username_cb
+    else:
+        player = db.create_player(group_id, user_id, username_cb)
+
+    # my_status — всегда в личку в группе
     if data == "my_status":
         if not player:
             await query.answer("⚠️ Нет персонажа. /start", show_alert=True)
             return
         sheet = format_status(player)
-        # Send as private message in group, popup in private
         if is_group(update):
             try:
                 await context.bot.send_message(user_id, sheet)
                 await query.answer("📜 Лист отправлен в личку!", show_alert=False)
             except Exception:
-                # If user hasn't started bot in private, show alert
                 await query.answer(
                     format_status(player, short=True)[:200],
                     show_alert=True
@@ -677,8 +848,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "inventory":
         inv  = player.get("inventory", [])
-        text = "🎒 Инвентарь:\n" + ("\n".join(f"• {i}" for i in inv) if inv else "пусто")
-        await query.message.reply_text(text, reply_markup=main_keyboard())
+        text = (
+            f"🎒 Инвентарь {player.get('name', 'Герой')}:\n"
+            + ("\n".join(f"• {i}" for i in inv) if inv else "пусто")
+        )
+        if is_group(update):
+            try:
+                await context.bot.send_message(user_id, text)
+                await query.answer("🎒 Инвентарь отправлен в личку!", show_alert=False)
+            except Exception:
+                await query.answer(text[:200], show_alert=True)
+        else:
+            await query.message.reply_text(text, reply_markup=main_keyboard())
 
     elif data == "quests":
         active = db.get_quests(group_id, "active")
@@ -687,33 +868,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if active: msg += "\n🔸 " + "\n  ".join(f"[{q['id']}] {q['title']}" for q in active)
         if done:   msg += "\n\n✅ " + "\n  ".join(f"[{q['id']}] {q['title']}" for q in done)
         if not active and not done: msg += "Нет квестов."
-        await query.message.reply_text(msg, reply_markup=main_keyboard())
-
-    elif data == "roll_d20":
-        roll = random.randint(1, 20)
-        note = " ✨ Критический успех!" if roll == 20 else (" 💀 Критическая неудача!" if roll == 1 else "")
-        await query.message.reply_text(
-            f"🎲 d20 ({player['name']}): **{roll}**{note}",
-            reply_markup=main_keyboard(),
-        )
-
-    elif data == "attack_quick":
-        str_mod = modifier(player["strength"])
-        dex_mod = modifier(player["dexterity"])
-        atk_mod = max(str_mod, dex_mod)
-        atk     = random.randint(1, 20)
-        total   = atk + atk_mod
-        dmg     = random.randint(1, 8) + max(str_mod, 0)
-        mod_s   = modifier_str(max(player["strength"], player["dexterity"]))
-        msg = f"⚔️ {player['name']} атакует!\n🎲 {atk} {mod_s} = **{total}**\n"
-        if atk == 20:
-            dmg *= 2
-            msg += f"✨ Крит! Урон: **{dmg}**"
-        elif atk == 1:
-            msg += "💀 Промах!"
+        if is_group(update):
+            try:
+                await context.bot.send_message(user_id, msg)
+                await query.answer("🗺️ Квесты отправлены в личку!", show_alert=False)
+            except Exception:
+                await query.answer(msg[:200], show_alert=True)
         else:
-            msg += f"🗡️ Урон: **{dmg}**"
-        await query.message.reply_text(msg, reply_markup=main_keyboard())
+            await query.message.reply_text(msg, reply_markup=main_keyboard())
 
     elif data == "rest_short":
         hit_die = player.get("hit_die", 8)
@@ -748,7 +910,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_help(query.message)
 
     elif data == "party_list":
-        # Reuse party command
         members = db.get_party(group_id)
         if not members:
             await query.message.reply_text("👥 Партия пуста.")
@@ -762,10 +923,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("\n".join(lines), reply_markup=party_keyboard())
 
     elif data == "roll_initiative":
-        # Inline button rolls initiative
         members = db.get_party(group_id)
         if members:
-            context._user_id = user_id
             await _do_roll_initiative(query.message, group_id)
         else:
             await query.message.reply_text("👥 Нет партии. /join чтобы вступить.")
@@ -776,15 +935,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order   = ts["turn_order"]
             cur_uid = order[ts["current_idx"] % len(order)]
             if cur_uid == user_id:
-                new_ts   = db.advance_turn(group_id)
-                new_order = new_ts["turn_order"]
-                new_uid   = new_order[new_ts["current_idx"] % len(new_order)]
-                members   = db.get_party(group_id)
-                name_map  = {m["user_id"]: m["username"] for m in members}
-                await query.message.reply_text(
-                    f"✅ Ход передан! Раунд {new_ts['round_number']} — ход: @{name_map.get(new_uid,'?')}!",
-                    reply_markup=party_keyboard(),
-                )
+                db.clear_pending_clarification(group_id)
+                new_ts  = db.advance_turn(group_id)
+                members = db.get_party(group_id)
+                await query.message.reply_text(_turn_banner(new_ts, members, group_id))
             else:
                 await query.message.reply_text("⚠️ Сейчас не твой ход!")
 
@@ -792,13 +946,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_combat_inline(query, data, player, group_id, user_id)
 
 
-async def _do_roll_initiative(message, group_id: int):
+async def _do_roll_initiative(message, group_id: int, bot=None):
     members = db.get_party(group_id)
     db.reset_initiatives(group_id)
     rolls = []
     for m in members:
-        p   = db.get_player(group_id, m["user_id"])
-        dex = p["dexterity"] if p else 10
+        p       = db.get_player(group_id, m["user_id"])
+        dex     = p["dexterity"] if p else 10
         dex_mod = modifier(dex)
         roll    = random.randint(1, 20)
         total   = roll + dex_mod
@@ -807,12 +961,13 @@ async def _do_roll_initiative(message, group_id: int):
     rolls.sort(reverse=True)
     order = [r[2] for r in rolls]
     db.set_turn_state(group_id, order, 0, 1, "combat")
+    ts = db.get_turn_state(group_id)
     lines = ["🎲 Инициатива:\n"]
     for i, (total, _, uid, uname, roll, dex_mod) in enumerate(rolls, 1):
         sign = "+" if dex_mod >= 0 else ""
         lines.append(f"{i}. @{uname}: {roll} {sign}{dex_mod} = **{total}**")
-    lines.append(f"\n⚔️ Первым ходит: @{rolls[0][3]}!")
     await message.reply_text("\n".join(lines), reply_markup=party_keyboard())
+    await message.reply_text(_turn_banner(ts, members, group_id))
 
 
 async def handle_combat_inline(query, data: str, player: dict, group_id: int, user_id: int):
@@ -904,7 +1059,6 @@ async def handle_combat_inline(query, data: str, player: dict, group_id: int, us
             f"{bar(enemy_hp, combat['enemy_max_hp'])}"
         )
         if enemy_hp <= 0:
-            xp = combat.get("xp_reward", 50)
             db.update_player(group_id, user_id, combat_state=None)
             db.add_message(group_id, "user",
                            f"{player['name']} победил {combat['enemy']}!", user_id=user_id)
@@ -1121,7 +1275,6 @@ async def cmd_fight(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_e = random.randint(1, 20)
     first  = "Ты действуешь первым!" if init_p >= init_e else f"{enemy} действует первым!"
 
-    # In group: also roll initiative for all
     in_group_game = is_group(update) and len(db.get_party(group_id)) > 1
     if in_group_game:
         await _do_roll_initiative(update.message, group_id)
@@ -1261,9 +1414,15 @@ async def send_help(message):
         "/join — вступить в партию\n"
         "/party — состав партии\n"
         "/roll_initiative — бросить инициативу\n"
-        "/done — завершить ход\n"
         "/end_combat — завершить бой\n\n"
-        "⚔️ Бой:\n"
+        "⚔️ Система ходов:\n"
+        "/ход <действие> — официальное действие (только в свой ход)\n"
+        "/turn <действие> — то же, английский алиас\n"
+        "/пас — пропустить свой ход\n"
+        "/skip — то же, английский алиас\n"
+        "/done — передать ход вручную\n"
+        "💬 Обычный текст в бою — свободный OOC-чат\n\n"
+        "⚔️ Боевые команды:\n"
         "/fight <враг> — начать бой\n"
         "/roll [NdS] — бросок кубика\n"
         "/check <навык> — проверка навыка\n"
@@ -1293,28 +1452,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_id, user_id = get_ids(update)
     username = get_username(update)
     player   = db.get_player(group_id, user_id)
+
     if not player:
         player = db.create_player(group_id, user_id, username)
+    elif player.get("username") != username:
+        # Обновляем username если изменился
+        db.update_player(group_id, user_id, username=username)
+        player["username"] = username
 
-    # In group: check whose turn it is
-    ts = db.get_turn_state(group_id)
-    if ts and ts["turn_order"] and is_group(update):
-        order   = ts["turn_order"]
-        cur_uid = order[ts["current_idx"] % len(order)]
-        if cur_uid != user_id and db.is_in_party(group_id, user_id):
-            members  = db.get_party(group_id)
-            name_map = {m["user_id"]: m["username"] for m in members}
-            await update.message.reply_text(
-                f"⚠️ Сейчас ход @{name_map.get(cur_uid,'?')}!\n"
-                f"Используй /done чтобы пропустить или дождись своей очереди."
+    char_name = player.get("name", username)
+    text      = update.message.text or ""
+
+    in_group = is_group(update)
+    ts       = db.get_turn_state(group_id)
+
+    # ── Clarification reply (reply to DM's question) ──────────────────────────
+    if in_group and ts and ts.get("pending_clarification"):
+        pc      = ts["pending_clarification"]
+        reply_to = update.message.reply_to_message
+        if (
+            reply_to is not None
+            and reply_to.message_id == pc.get("dm_message_id")
+            and user_id == pc.get("user_id")
+        ):
+            original = pc.get("original_action", "")
+            clarif_text = (
+                f"[УТОЧНЕНИЕ от {char_name}] "
+                f"Исходное действие: «{original}» | Уточнение: {text}"
             )
+            db.add_message(group_id, "user", clarif_text, user_id=user_id)
+            db.clear_pending_clarification(group_id)
+            await update.message.chat.send_action(ChatAction.TYPING)
+            sent = await dm_reply(update, group_id, user_id)
+
+            async def _advance_after_clarif():
+                await asyncio.sleep(2)
+                new_ts = db.advance_turn(group_id)
+                if new_ts and new_ts["turn_order"]:
+                    party = db.get_party(group_id)
+                    await context.bot.send_message(group_id, _turn_banner(new_ts, party, group_id))
+
+            asyncio.create_task(_advance_after_clarif())
             return
 
-    # Prefix group messages with player name
-    text = update.message.text
-    if is_group(update):
-        text = f"[{player.get('name', username)}]: {text}"
+    # ── В группе: записываем всё в историю, отвечаем ТОЛЬКО на «дм» ──────────
+    if in_group:
+        tagged_text = f"[{char_name}]: {text}"
+        db.add_message(group_id, "user", tagged_text, user_id=user_id)
 
+        # Бот реагирует только если написали «дм» (в любом регистре)
+        if "дм" in text.lower():
+            await update.message.chat.send_action(ChatAction.TYPING)
+            await dm_reply(update, group_id, user_id)
+        # Иначе — молча записали в историю и всё
+        return
+
+    # ── Приватный чат: всегда отвечаем ───────────────────────────────────────
     db.add_message(group_id, "user", text, user_id=user_id)
     await update.message.chat.send_action(ChatAction.TYPING)
     await dm_reply(update, group_id, user_id)
@@ -1371,8 +1564,13 @@ def main():
         ("roll_initiative", cmd_roll_initiative),
         ("done",            cmd_done),
         ("end_combat",      cmd_end_combat),
+        ("turn",            cmd_turn),
+        ("skip",            cmd_skip),
     ]:
         app.add_handler(CommandHandler(name, handler))
+
+    app.add_handler(CommandHandler("ход",  cmd_khod))
+    app.add_handler(CommandHandler("пас",  cmd_pas))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

@@ -1,4 +1,4 @@
-﻿import random
+import random
 import re
 import json
 from typing import Dict, List, Tuple, Optional
@@ -202,6 +202,44 @@ def build_party_context(players: List[Dict], quests: List[Dict]) -> str:
         for q in quests[:5]:
             lines.append(f"  [{q['id']}] {q['title']}")
     lines.append("=== КОНЕЦ ===")
+    return "\n".join(lines)
+
+# ── Memory block formatter ────────────────────────────────────────────────────
+
+MEMORY_ICONS = {
+    "npc":    "👤",
+    "world":  "🌍",
+    "plot":   "📖",
+    "player": "🎭",
+    "loot":   "💎",
+}
+
+def format_memory_block(memories: List[Dict]) -> str:
+    """Форматирует записи долгосрочной памяти для вставки в системный промпт."""
+    if not memories:
+        return ""
+
+    by_cat: Dict[str, List[Dict]] = {}
+    for m in memories:
+        cat = m.get("category", "world")
+        by_cat.setdefault(cat, []).append(m)
+
+    lines = ["📚 ПАМЯТЬ DM (всегда актуально):"]
+    order = ["plot", "npc", "world", "player", "loot"]
+    for cat in order:
+        if cat not in by_cat:
+            continue
+        icon = MEMORY_ICONS.get(cat, "•")
+        for entry in by_cat[cat]:
+            lines.append(f"  {icon} [{entry['key']}] {entry['value']}")
+
+    # остальные категории (не из стандартных)
+    for cat, entries in by_cat.items():
+        if cat in order:
+            continue
+        for entry in entries:
+            lines.append(f"  • [{entry['key']}] {entry['value']}")
+
     return "\n".join(lines)
 
 # ── AI State Parser ───────────────────────────────────────────────────────────
