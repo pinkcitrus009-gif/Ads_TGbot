@@ -25,33 +25,52 @@ class Database:
     def create_tables(self):
         self.conn.executescript('''
             CREATE TABLE IF NOT EXISTS players (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                group_id     INTEGER NOT NULL,
-                user_id      INTEGER NOT NULL,
-                username     TEXT    DEFAULT '',
-                name         TEXT    DEFAULT 'Герой',
-                race         TEXT    DEFAULT 'Человек',
-                class        TEXT    DEFAULT 'Авантюрист',
-                level        INTEGER DEFAULT 1,
-                hp           INTEGER DEFAULT 10,
-                max_hp       INTEGER DEFAULT 10,
-                armor_class  INTEGER DEFAULT 10,
-                exp          INTEGER DEFAULT 0,
-                exp_next     INTEGER DEFAULT 300,
-                gold         INTEGER DEFAULT 0,
-                strength     INTEGER DEFAULT 10,
-                dexterity    INTEGER DEFAULT 10,
-                constitution INTEGER DEFAULT 10,
-                intelligence INTEGER DEFAULT 10,
-                wisdom       INTEGER DEFAULT 10,
-                charisma     INTEGER DEFAULT 10,
-                inventory    TEXT    DEFAULT '[]',
-                abilities    TEXT    DEFAULT '[]',
-                spell_slots  TEXT    DEFAULT NULL,
-                combat_state TEXT    DEFAULT NULL,
-                hit_die      INTEGER DEFAULT 8,
-                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id            INTEGER NOT NULL,
+                user_id             INTEGER NOT NULL,
+                username            TEXT    DEFAULT '',
+                name                TEXT    DEFAULT 'Герой',
+                race                TEXT    DEFAULT 'Человек',
+                class               TEXT    DEFAULT 'Авантюрист',
+                level               INTEGER DEFAULT 1,
+                hp                  INTEGER DEFAULT 10,
+                max_hp              INTEGER DEFAULT 10,
+                armor_class         INTEGER DEFAULT 10,
+                exp                 INTEGER DEFAULT 0,
+                exp_next            INTEGER DEFAULT 300,
+                gold                INTEGER DEFAULT 0,
+                strength            INTEGER DEFAULT 10,
+                dexterity           INTEGER DEFAULT 10,
+                constitution        INTEGER DEFAULT 10,
+                intelligence        INTEGER DEFAULT 10,
+                wisdom              INTEGER DEFAULT 10,
+                charisma            INTEGER DEFAULT 10,
+                inventory           TEXT    DEFAULT '[]',
+                abilities           TEXT    DEFAULT '[]',
+                spell_slots         TEXT    DEFAULT NULL,
+                combat_state        TEXT    DEFAULT NULL,
+                hit_die             INTEGER DEFAULT 8,
+                -- D&D 5e расширенные поля
+                speed               INTEGER DEFAULT 30,
+                background          TEXT    DEFAULT '',
+                alignment           TEXT    DEFAULT '',
+                inspiration         INTEGER DEFAULT 0,
+                saving_throw_profs  TEXT    DEFAULT '[]',
+                skill_profs         TEXT    DEFAULT '[]',
+                skill_expertises    TEXT    DEFAULT '[]',
+                languages           TEXT    DEFAULT '[]',
+                armor_profs         TEXT    DEFAULT '[]',
+                weapon_profs        TEXT    DEFAULT '[]',
+                tool_profs          TEXT    DEFAULT '[]',
+                features            TEXT    DEFAULT '[]',
+                personality         TEXT    DEFAULT '',
+                ideals              TEXT    DEFAULT '',
+                bonds               TEXT    DEFAULT '',
+                flaws               TEXT    DEFAULT '',
+                death_saves_success INTEGER DEFAULT 0,
+                death_saves_failure INTEGER DEFAULT 0,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(group_id, user_id)
             );
 
@@ -154,6 +173,41 @@ class Database:
         except Exception:
             pass
 
+        # ── players: добавить D&D 5e поля если их нет (миграция старых БД) ──────
+        new_player_cols = [
+            "speed               INTEGER DEFAULT 30",
+            "background          TEXT    DEFAULT ''",
+            "alignment           TEXT    DEFAULT ''",
+            "inspiration         INTEGER DEFAULT 0",
+            "saving_throw_profs  TEXT    DEFAULT '[]'",
+            "skill_profs         TEXT    DEFAULT '[]'",
+            "skill_expertises    TEXT    DEFAULT '[]'",
+            "languages           TEXT    DEFAULT '[]'",
+            "armor_profs         TEXT    DEFAULT '[]'",
+            "weapon_profs        TEXT    DEFAULT '[]'",
+            "tool_profs          TEXT    DEFAULT '[]'",
+            "features            TEXT    DEFAULT '[]'",
+            "personality         TEXT    DEFAULT ''",
+            "ideals              TEXT    DEFAULT ''",
+            "bonds               TEXT    DEFAULT ''",
+            "flaws               TEXT    DEFAULT ''",
+            "death_saves_success INTEGER DEFAULT 0",
+            "death_saves_failure INTEGER DEFAULT 0",
+        ]
+        existing_cols = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(players)").fetchall()
+        }
+        for col_def in new_player_cols:
+            col_name = col_def.strip().split()[0]
+            if col_name not in existing_cols:
+                try:
+                    self.conn.execute(f"ALTER TABLE players ADD COLUMN {col_def}")
+                    self.conn.commit()
+                    logger.info("Migration: added players.%s", col_name)
+                except Exception as exc:
+                    logger.warning("Migration players.%s skipped: %s", col_name, exc)
+
         # ── saved_games: миграция со старой схемы (с group_id) на глобальную ──
         # Определяем, есть ли колонка group_id в saved_games
         try:
@@ -192,10 +246,26 @@ class Database:
 
     def _decode_player(self, row) -> Dict:
         data = dict(row)
+        # Базовые списки
         data['inventory']    = json.loads(data.get('inventory')    or '[]')
         data['abilities']    = json.loads(data.get('abilities')    or '[]')
         data['spell_slots']  = json.loads(data['spell_slots'])  if data.get('spell_slots')  else {}
         data['combat_state'] = json.loads(data['combat_state']) if data.get('combat_state') else None
+        # D&D 5e расширенные поля
+        for list_field in (
+            'saving_throw_profs', 'skill_profs', 'skill_expertises',
+            'languages', 'armor_profs', 'weapon_profs', 'tool_profs', 'features',
+        ):
+            raw = data.get(list_field)
+            data[list_field] = json.loads(raw) if raw else []
+        # Текстовые поля — гарантируем строку
+        for str_field in ('background', 'alignment', 'personality', 'ideals', 'bonds', 'flaws'):
+            data[str_field] = data.get(str_field) or ''
+        # Числовые поля с дефолтами
+        data.setdefault('speed', 30)
+        data.setdefault('inspiration', 0)
+        data.setdefault('death_saves_success', 0)
+        data.setdefault('death_saves_failure', 0)
         return data
 
     # ── Players ───────────────────────────────────────────────────────────────
@@ -271,7 +341,12 @@ class Database:
         return self.get_player(group_id, user_id), copied
 
     def update_player(self, group_id: int, user_id: int, **kwargs) -> Dict:
-        for key in ('inventory', 'abilities', 'spell_slots', 'combat_state'):
+        json_fields = (
+            'inventory', 'abilities', 'spell_slots', 'combat_state',
+            'saving_throw_profs', 'skill_profs', 'skill_expertises',
+            'languages', 'armor_profs', 'weapon_profs', 'tool_profs', 'features',
+        )
+        for key in json_fields:
             if key in kwargs and not isinstance(kwargs[key], str):
                 kwargs[key] = (json.dumps(kwargs[key], ensure_ascii=False)
                                if kwargs[key] is not None else None)

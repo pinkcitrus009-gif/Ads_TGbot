@@ -35,6 +35,9 @@ from character import (
     check_level_up, default_spell_slots, format_memory_block, format_status,
     modifier, modifier_str, parse_ai_state, roll_dice, roll_stats_array,
     xp_for_level,
+    CLASS_SAVING_THROWS, CLASS_DEFAULT_SKILLS, CLASS_FEATURES_L1,
+    RACE_TRAITS, RACE_SPEED, RACE_LANGUAGES,
+    CLASS_ARMOR_PROFS, CLASS_WEAPON_PROFS,
 )
 from database import Database
 from keyboards import (
@@ -533,12 +536,36 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     max_hp  = max(1, cd.get("hp", 10) + con_mod)
     slots   = default_spell_slots(cls, 1)
 
+    # Авто-заполняем поля D&D 5e на основе расы и класса
+    class_features = CLASS_FEATURES_L1.get(cls, [])
+    race_features   = RACE_TRAITS.get(race, [])
+    all_features    = class_features + race_features
+
     db.update_player(
         group_id, user_id,
         username=username, name=name, race=race, **{"class": cls},
         level=1, hp=max_hp, max_hp=max_hp,
         armor_class=cd.get("ac", 10), hit_die=cd.get("hit_die", 8),
         exp=0, exp_next=300, gold=0, spell_slots=slots, **s,
+        # D&D 5e расширенные поля
+        speed=RACE_SPEED.get(race, 30),
+        saving_throw_profs=CLASS_SAVING_THROWS.get(cls, []),
+        skill_profs=CLASS_DEFAULT_SKILLS.get(cls, []),
+        skill_expertises=[],
+        languages=RACE_LANGUAGES.get(race, ["Общий"]),
+        armor_profs=CLASS_ARMOR_PROFS.get(cls, []),
+        weapon_profs=CLASS_WEAPON_PROFS.get(cls, []),
+        tool_profs=[],
+        features=all_features,
+        background='',
+        alignment='',
+        inspiration=0,
+        personality='',
+        ideals='',
+        bonds='',
+        flaws='',
+        death_saves_success=0,
+        death_saves_failure=0,
     )
 
     # Auto-join party in group chats
