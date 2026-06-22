@@ -98,8 +98,31 @@ BASE_PROMPT = """Ты — мастер подземелий (DM) для наст
 СТИЛЬ:
 • Ярко и образно — атмосфера, диалоги, напряжение, юмор
 • Никаких звёздочек/решёток — только текст и эмодзи
-• Ответы 150–300 слов. В конце — открытый вопрос или выбор для игроков
 • Учитывай характеристики персонажа — они реально влияют на события
+
+ДЛИНА ОТВЕТА — выбирай сам по ситуации:
+
+🔸 КОРОТКО (1–3 предложения) — когда нужно просто уточнить или подтвердить:
+  • Игрок уходит/прерывается: "Куда направляешься?" / "Вернёшься к постоялому двору?"
+  • Простой вопрос или уточнение к действию игрока
+  • Очевидный результат простого действия: открыл дверь, поднял монету
+  • Ответ NPC одной фразой
+
+🔹 СРЕДНЕ (60–120 слов) — стандартный ход:
+  • Обычный ход в бою (атака, заклинание, манёвр)
+  • Диалог с NPC без ключевых откровений
+  • Перемещение между локациями
+  • Проверка навыков с обычным результатом
+
+🔷 ПОДРОБНО (150–300 слов) — важные моменты:
+  • Первое появление в новой локации
+  • Начало схватки или финальный удар
+  • Крупное сюжетное откровение
+  • Смерть/победа над боссом, поворот сюжета
+  • Первая встреча с важным NPC
+
+В конце КОРОТКИХ и СРЕДНИХ ответов — короткий вопрос или выбор (1 строка).
+В конце ПОДРОБНЫХ — развёрнутый выбор с вариантами.
 
 СИСТЕМА ХОДОВ В ГРУППЕ (важно!):
 • Сообщения с пометкой [ДЕЙСТВИЕ] — официальный ход игрока. Обработай и опиши результат.
@@ -389,7 +412,7 @@ def _turn_banner(ts: dict, party: list, group_id: int) -> str:
         f"👤 @{cur_uname} ({char_name} — {cls} ур.{lvl})\n"
         f"❤️ {hp}/{max_hp}  {hp_bar}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Используй /ход <действие> или /пас"
+        f"Используй /khod <действие> или /pas"
     )
 
 
@@ -667,12 +690,12 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_khod(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/ход <действие> — официальное игровое действие текущего игрока."""
+    """/khod <действие> — официальное игровое действие текущего игрока."""
     group_id, user_id = get_ids(update)
 
     if not is_group(update):
         await update.message.reply_text(
-            "❌ /ход работает только в групповых чатах.\n"
+            "❌ /khod работает только в групповых чатах.\n"
             "В личке просто напиши что делаешь!"
         )
         return
@@ -692,7 +715,7 @@ async def cmd_khod(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name_map = {m["user_id"]: m["username"] for m in party}
         await update.message.reply_text(
             f"⚠️ Сейчас ход @{name_map.get(cur_uid,'?')}!\n"
-            f"Ты можешь свободно общаться — /ход доступен только в свою очередь."
+            f"Ты можешь свободно общаться — /khod доступен только в свою очередь."
         )
         return
 
@@ -707,7 +730,7 @@ async def cmd_khod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "📝 Опиши своё действие:\n"
-            "Например: /ход Атакую ближайшего гоблина мечом"
+            "Например: /khod Атакую ближайшего гоблина мечом"
         )
         return
 
@@ -747,12 +770,12 @@ async def cmd_khod(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_turn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/turn — алиас /ход."""
+    """/turn — алиас /khod."""
     await cmd_khod(update, context)
 
 
 async def cmd_pas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/пас — пропустить свой ход (уклонение)."""
+    """/pas — пропустить свой ход (уклонение)."""
     group_id, user_id = get_ids(update)
     ts = db.get_turn_state(group_id)
 
@@ -1416,9 +1439,9 @@ async def send_help(message):
         "/roll_initiative — бросить инициативу\n"
         "/end_combat — завершить бой\n\n"
         "⚔️ Система ходов:\n"
-        "/ход <действие> — официальное действие (только в свой ход)\n"
+        "/khod <действие> — официальное действие (только в свой ход)\n"
         "/turn <действие> — то же, английский алиас\n"
-        "/пас — пропустить свой ход\n"
+        "/pas — пропустить свой ход\n"
         "/skip — то же, английский алиас\n"
         "/done — передать ход вручную\n"
         "💬 Обычный текст в бою — свободный OOC-чат\n\n"
@@ -1569,8 +1592,8 @@ def main():
     ]:
         app.add_handler(CommandHandler(name, handler))
 
-    app.add_handler(CommandHandler("ход",  cmd_khod))
-    app.add_handler(CommandHandler("пас",  cmd_pas))
+    app.add_handler(CommandHandler("khod", cmd_khod))
+    app.add_handler(CommandHandler("pas",  cmd_pas))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
