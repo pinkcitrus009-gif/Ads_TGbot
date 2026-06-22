@@ -96,7 +96,7 @@ BASE_PROMPT = """Ты — мастер подземелий (DM) для наст
 - Начался или завершился квест
 
 → Добавь в САМЫЙ КОНЕЦ ответа (после всего текста) блок:
-[STATE]{"hp_change":0,"gold":0,"exp":0,"items_add":[],"items_remove":[],"abilities_add":[],"quests_add":[],"quests_done":[]}[/STATE]
+[STATE]{{"hp_change":0,"gold":0,"exp":0,"items_add":[],"items_remove":[],"abilities_add":[],"quests_add":[],"quests_done":[]}}[/STATE]
 
 Правила блока STATE:
 • hp_change: число (отрицательное = урон, положительное = лечение, 0 = без изменений)
